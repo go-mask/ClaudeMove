@@ -1,0 +1,10 @@
+# 建置產物 (安裝檔改用 GitHub Release 發佈)
+dist/
+
+# 測試產物
+*.claudepack.zip
+*.log
+
+# 系統
+Thumbs.db
+Desktop.ini
