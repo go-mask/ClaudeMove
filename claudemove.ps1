@@ -86,10 +86,23 @@ switch ($Command) {
 
         Write-Host "`n=== Claude 資產盤點 ($($inv.machine.computerName)) ===" -ForegroundColor Yellow
         Write-Host ("Claude Code : {0}  (settings: {1}, history: {2})" -f $inv.claudeCode.root, $inv.claudeCode.hasSettings, $inv.claudeCode.hasHistory)
+        Write-Host ("設定檔      : {0}  (MCP: {1} 個, 已登錄專案: {2} 個)" -f `
+            $(if ($inv.claudeCode.hasConfig) { $inv.claudeCode.configFile } else { '(找不到 .claude.json)' }),
+            @($inv.claudeCode.configMcpServers).Count, $inv.claudeCode.configProjectCount)
         Write-Host ("Desktop     : {0}  (MCP 伺服器: {1} 個, Desktop sessions: {2})" -f $inv.desktop.root, @($inv.desktop.mcpServers).Count, $inv.desktop.desktopSessionCount)
-        Write-Host "`n專案:" -ForegroundColor Cyan
-        $inv.claudeCode.projects | Format-Table slug, realPath, pathExists, isGitRepo, sessionCount, memoryCount,
-            @{n='sizeMB'; e={ [math]::Round($_.sizeBytes / 1MB, 1) }} -AutoSize | Out-String | Write-Host
+        if (@($inv.claudeCode.pluginMarketplaces).Count -gt 0) {
+            Write-Host ("外掛市集    : {0}" -f (@($inv.claudeCode.pluginMarketplaces) -join ', '))
+        }
+        Write-Host "`n專案 (pathSource: config=設定檔權威 / cwd-slug=紀錄比對 / cwd-frequency=推測):" -ForegroundColor Cyan
+        $inv.claudeCode.projects | Format-Table `
+            @{n='slug'; e={ $_.slug }},
+            @{n='realPath'; e={ $_.realPath }},
+            @{n='src'; e={ $_.pathSource }},
+            @{n='存在'; e={ if ($_.pathExists) { 'Y' } else { '-' } }},
+            @{n='git'; e={ if ($_.isGitRepo) { 'Y' } else { '-' } }},
+            @{n='sess'; e={ $_.sessionCount }},
+            @{n='mem'; e={ $_.memoryCount }},
+            @{n='MB'; e={ [math]::Round($_.sizeBytes / 1MB, 1) }} -AutoSize | Out-String -Width 200 | Write-Host
         $ms = @($inv.desktop.mcpServers | Where-Object machineSpecific)
         if ($ms.Count -gt 0) {
             Write-Host "含機器特定絕對路徑的 MCP 伺服器 (換機需調整):" -ForegroundColor Cyan

@@ -1,4 +1,4 @@
-# ClaudeMove
+﻿# ClaudeMove
 
 在多台 Windows 電腦之間**備份、轉移、合併** Claude Desktop / Claude Code 本地資料的工具。
 
@@ -10,7 +10,9 @@ Claude 的資料分三種同步狀態:
 |---|---|---|
 | claude.ai 對話、雲端專案 | Anthropic 雲端 | 登入即同步,**不需要本工具** |
 | 程式碼 | 你的專案資料夾 | 請用 git + 遠端倉庫,**不建議用本工具搬** |
-| Claude Code session 紀錄、記憶、設定、MCP 配置 | `~\.claude` 與 `%APPDATA%\Claude` | **會遺失 — 本工具負責這塊** |
+| Claude Code session 紀錄、記憶 | `~\.claude\projects` | **會遺失 — 本工具負責這塊** |
+| 工具授權、專案信任狀態、Code 端 MCP | `~\.claude.json` | **會遺失,每個專案都要重新授權** |
+| Desktop 端 MCP、外掛市集清單 | `%APPDATA%\Claude`、`~\.claude\plugins` | **會遺失** |
 
 ## 安裝
 
@@ -73,6 +75,18 @@ Claude 的資料分三種同步狀態:
 工具會自動改名專案資料夾(slug),並改寫 session 紀錄內的所有路徑引用。
 **建議:讓所有電腦的專案路徑保持一致,即可完全省略對映檔。**
 
+### 專案實體路徑怎麼判定(`pathSource` 欄位)
+
+專案資料夾名(如 `E--Claude-Move-Merge`)是 Claude Code 把實體路徑的非英數字元換成 `-` 得來的,無法直接反推。工具依可靠度三層判定,盤點表格的 `src` 欄會標示用了哪一層:
+
+| pathSource | 依據 | 可靠度 |
+|---|---|---|
+| `config` | `~\.claude.json` 的專案登錄清單 | 權威解答 |
+| `cwd-slug` | session 紀錄中 slug 與資料夾名相符的 `cwd` | 精確 |
+| `cwd-frequency` | 出現最多次的 `cwd`(無一相符時的最後手段) | **推測,會警告並在 GUI 標黃** |
+
+新版 Claude Code 會在同一個 session 檔內寫入多個 `cwd`(續聊、跨目錄、子代理),所以只看第一個會取到別的專案的路徑——這是 v0.7.0 修正的重點。
+
 不想手寫對映檔?用 `suggest` 自動產生草稿:
 
 ```powershell
@@ -99,15 +113,24 @@ Claude 的資料分三種同步狀態:
 - **session 紀錄(.jsonl)**:檔名是唯一 UUID,兩邊取聯集;同名檔案「較新的優先」,被覆蓋前先備份
 - **記憶(memory/)**:一檔一記憶,取聯集;索引 `MEMORY.md` 逐行聯集合併
 - **history.jsonl**:逐行去重後附加
-- **settings.json、claude_desktop_config.json**:含機器特定路徑,**永不自動套用**,放入 `~\.claude\claudemove-review\` 待人工審閱
+- **設定類檔案永不自動套用**,一律放入待審閱區 `~\.claude\claudemove\review\<時間戳>\` 供人工比對後手動採用:
+
+  | 檔案 | 內容 |
+  |---|---|
+  | `claude.json.portable.json` | `~\.claude.json` 的可攜部分(MCP 設定 + 每專案工具授權/信任狀態),**已套用路徑對映改寫**,可直接參照 |
+  | `settings.incoming.json` | 來源機的 `settings.json` |
+  | `claude_desktop_config.incoming.json` | Desktop 端 MCP 設定(常含機器特定絕對路徑) |
+  | `plugins.marketplaces.json` | 外掛市集清單(市集本體請在目標機重新安裝) |
+
 - `-Mode Move`:目標已有同專案時整案跳過(適合單純搬新機,不想碰既有資料)
 
 ## 安全設計
 
-- 憑證(`.credentials.json`)、快取、shell snapshots **永不匯出**(硬性黑名單)
+- 憑證(`.credentials.json`)、快取、執行期金鑰(`sessions\`)**永不匯出**(硬性黑名單)
+- `~\.claude.json` 採**白名單**擷取,只帶走 `mcpServers` 與 `projects`;`userID`、`machineID`、`oauthAccount`(帳號 UUID、email、組織與訂閱資訊)一律不進遷移包
 - import 預設 dry-run,`-Apply` 才動手
-- 執行前自動備份受影響檔案至 `~\.claude\backups\claudemove-<時間戳>\`
-- 全部動作寫入 `~\.claude\claudemove-logs\`
+- 執行前自動備份受影響檔案至 `~\.claude\claudemove\backups\import-<時間戳>\`
+- 全部動作寫入 `~\.claude\claudemove\logs\`(工具產出一律收在 `claudemove\` 之下,不與官方自用的 `~\.claude\backups` 混雜)
 - 偵測到 Claude 執行中會警告(避免複製寫入中的檔案)
 
 ## 限制與注意
@@ -121,7 +144,8 @@ Claude 的資料分三種同步狀態:
   ```
 
   會把所有指向舊路徑的 slug 合併進現路徑的 slug、改寫全部路徑引用、原資料夾移入備份區
-- `~\.claude` 為未文件化的內部格式,Claude 改版後結構可能變動;遷移包內含格式版本號,不相容時工具會拒絕匯入而非損毀資料
+- `~\.claude` 為未文件化的內部格式,Claude 改版後結構可能變動;遷移包內含格式版本號(目前 v2,可讀入舊版 v1 包),不相容時工具會拒絕匯入而非損毀資料
+- **外掛本體不打包**:`~\.claude\plugins\marketplaces` 是可重新下載的市集 clone(數百個檔案),只帶走清單
 - 匯入後**建議重開 Claude Desktop** 再確認結果
 
 ## 專案結構

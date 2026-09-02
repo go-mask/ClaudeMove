@@ -4,14 +4,20 @@
 
 Set-StrictMode -Version Latest
 
-$script:ToolVersion       = '0.6.2'
-$script:PackFormatVersion = 1
+$script:ToolVersion       = '0.7.0'
+$script:PackFormatVersion = 2
 
 # 永不匯出的機密/快取黑名單 (相對 .claude 根目錄)
+# sessions = 執行期 <pid>.key/<pid>.json 金鑰; plugins\marketplaces = 可重新下載的市集 clone
 $script:HardExclude = @(
     '.credentials.json', 'cache', 'session-env', 'shell-snapshots',
-    'downloads', 'backups', '.last-cleanup', 'mcp-needs-auth-cache.json'
+    'downloads', 'backups', '.last-cleanup', 'mcp-needs-auth-cache.json',
+    'sessions', 'claudemove'
 )
+
+# ~/.claude.json 只保留這些鍵 (白名單制): 其餘含 userID / machineID / oauthAccount
+# 等身分與快取資料, 絕不可跨機複製。
+$script:ConfigKeepKeys = @('mcpServers', 'projects')
 
 #region 共用
 
@@ -24,6 +30,36 @@ function Get-ClaudeDefaultPaths {
     }
 }
 
+function Get-ClaudeConfigFile {
+    # 新版 Claude Code 的核心設定檔: 與 .claude 資料夾同層的 .claude.json
+    param([Parameter(Mandatory)][string]$ClaudeDir)
+    $parent = Split-Path $ClaudeDir -Parent
+    if (-not $parent) { return $null }
+    return (Join-Path $parent '.claude.json')
+}
+
+function Get-ClaudeConfigProjectMap {
+    <#
+    .SYNOPSIS
+        從 ~/.claude.json 的 projects 清單建出 slug -> 實體路徑 對照表。
+        專案資料夾名就是由這些路徑算出來的, 因此 slug 對得上即為權威解答。
+    #>
+    param([string]$ConfigFile)
+    $map = @{}
+    if (-not $ConfigFile -or -not (Test-Path $ConfigFile)) { return $map }
+    try {
+        $cfg = Get-Content $ConfigFile -Raw -Encoding utf8 | ConvertFrom-Json
+        if ($cfg.PSObject.Properties['projects']) {
+            foreach ($p in $cfg.projects.PSObject.Properties) {
+                # .claude.json 內正斜線與反斜線混用, 統一正規化為 Windows 反斜線
+                $norm = ($p.Name -replace '/', '\').TrimEnd('\')
+                if ($norm) { $map[(ConvertTo-ClaudeSlug $norm)] = $norm }
+            }
+        }
+    } catch { }
+    return $map
+}
+
 function ConvertTo-ClaudeSlug {
     # Claude Code 將專案絕對路徑轉為資料夾名: 非英數字元一律變 '-'
     param([Parameter(Mandatory)][string]$Path)
@@ -31,23 +67,49 @@ function ConvertTo-ClaudeSlug {
 }
 
 function Get-ProjectRealPath {
-    # slug 反推有歧義, 唯一可靠來源是 session jsonl 內的 "cwd" 欄位
-    param([Parameter(Mandatory)][string]$ProjectDir)
-    $jsonls = Get-ChildItem -Path $ProjectDir -Filter '*.jsonl' -File -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending
-    foreach ($f in $jsonls) {
+    <#
+    .SYNOPSIS
+        決定專案的實體路徑, 回傳 @{ path; source; ambiguous }。
+    .NOTES
+        新版 Claude Code 會在同一個 session 檔內寫入多個 cwd (續聊 / 跨目錄 / 子代理),
+        所以舊版「取第一個 cwd」會取到別的專案的路徑, 進而在匯入時把紀錄併錯專案。
+        可靠度由高到低:
+          1. config        — ~/.claude.json 的 projects 清單 (資料夾名即由此算出)
+          2. cwd-slug      — jsonl 內 slug 等於資料夾名的 cwd
+          3. cwd-frequency — 出現最多次的 cwd (最後手段, 標記 ambiguous)
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ProjectDir,
+        [hashtable]$ConfigProjectMap
+    )
+    $slug = Split-Path $ProjectDir -Leaf
+
+    if ($ConfigProjectMap -and $ConfigProjectMap.ContainsKey($slug)) {
+        return [pscustomobject]@{ path = $ConfigProjectMap[$slug]; source = 'config'; ambiguous = $false }
+    }
+
+    $counts = @{}
+    foreach ($f in (Get-ChildItem -Path $ProjectDir -Filter '*.jsonl' -File -ErrorAction SilentlyContinue |
+                    Sort-Object LastWriteTime -Descending)) {
         $reader = [System.IO.StreamReader]::new($f.FullName)
         try {
-            $n = 0
-            while (-not $reader.EndOfStream -and $n -lt 50) {
-                $line = $reader.ReadLine(); $n++
+            while (-not $reader.EndOfStream) {
+                $line = $reader.ReadLine()
                 if ($line -match '"cwd":"((?:[^"\\]|\\.)*)"') {
-                    return $Matches[1] -replace '\\\\', '\'
+                    $v = $Matches[1] -replace '\\\\', '\'
+                    # slug 對得上資料夾名即為正解, 立刻回傳 (避免掃完大檔)
+                    if ((ConvertTo-ClaudeSlug $v) -eq $slug) {
+                        return [pscustomobject]@{ path = $v; source = 'cwd-slug'; ambiguous = $false }
+                    }
+                    if ($counts.ContainsKey($v)) { $counts[$v]++ } else { $counts[$v] = 1 }
                 }
             }
         } finally { $reader.Dispose() }
     }
-    return $null
+    if ($counts.Count -eq 0) { return $null }
+
+    $best = ($counts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Key
+    return [pscustomobject]@{ path = $best; source = 'cwd-frequency'; ambiguous = $true }
 }
 
 function Get-GitRemoteUrl {
@@ -72,6 +134,31 @@ function Get-PackManifest {
         $sr = [System.IO.StreamReader]::new($entry.Open())
         try { return ($sr.ReadToEnd() | ConvertFrom-Json) } finally { $sr.Dispose() }
     } finally { $zip.Dispose() }
+}
+
+function Get-ClaudePluginMarketplaces {
+    # 新版外掛體系: 列出已安裝的市集名稱 (市集本體可重新下載, 只需帶走清單)
+    param([Parameter(Mandatory)][string]$ClaudeDir)
+    $dir = Join-Path $ClaudeDir 'plugins\marketplaces'
+    if (-not (Test-Path $dir)) { return @() }
+    return @(Get-ChildItem $dir -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+}
+
+function Get-SanitizedClaudeConfig {
+    <#
+    .SYNOPSIS
+        讀 ~/.claude.json 並只保留可跨機攜帶的鍵 (白名單), 剔除 userID / machineID /
+        oauthAccount 等身分與快取欄位。找不到檔案或無可留內容時回傳 $null。
+    #>
+    param([Parameter(Mandatory)][string]$ConfigFile)
+    if (-not (Test-Path $ConfigFile)) { return $null }
+    try { $cfg = Get-Content $ConfigFile -Raw -Encoding utf8 | ConvertFrom-Json } catch { return $null }
+    $out = [ordered]@{}
+    foreach ($k in $script:ConfigKeepKeys) {
+        if ($cfg.PSObject.Properties[$k]) { $out[$k] = $cfg.$k }
+    }
+    if ($out.Count -eq 0) { return $null }
+    return [pscustomobject]$out
 }
 
 function Get-RunningClaudeProcesses {
@@ -115,13 +202,34 @@ function Get-ClaudeInventory {
         $warnings.Add("偵測到執行中的 Claude 程序 ($($running -join ', ')) — 匯出/匯入前建議關閉, 避免複製到寫入中的檔案。")
     }
 
-    # --- Claude Code (~/.claude) ---
+    # --- Claude Code (~/.claude 與同層的 .claude.json) ---
+    $configFile = Get-ClaudeConfigFile -ClaudeDir $ClaudeDir
+    $configMap  = Get-ClaudeConfigProjectMap -ConfigFile $configFile
+    $configMcp  = @()
+    if ($configFile -and (Test-Path $configFile)) {
+        try {
+            $cfgJson = Get-Content $configFile -Raw -Encoding utf8 | ConvertFrom-Json
+            if ($cfgJson.PSObject.Properties['mcpServers']) {
+                $configMcp = @($cfgJson.mcpServers.PSObject.Properties.Name)
+            }
+        } catch { $warnings.Add(".claude.json 解析失敗: $($_.Exception.Message)") }
+    } else {
+        $warnings.Add("找不到 .claude.json (新版 Claude Code 的核心設定檔), 路徑反推將只依賴 session 紀錄。")
+    }
+
     $projects = [System.Collections.Generic.List[object]]::new()
     $projectsRoot = Join-Path $ClaudeDir 'projects'
     if (Test-Path $projectsRoot) {
         foreach ($dir in (Get-ChildItem $projectsRoot -Directory)) {
-            $realPath = Get-ProjectRealPath -ProjectDir $dir.FullName
-            if (-not $realPath) { $warnings.Add("專案 $($dir.Name) 的 jsonl 中找不到 cwd, 無法反推實體路徑 (合併時不做路徑改寫)。") }
+            $resolved = Get-ProjectRealPath -ProjectDir $dir.FullName -ConfigProjectMap $configMap
+            $realPath   = $null
+            $pathSource = 'none'
+            if ($resolved) { $realPath = $resolved.path; $pathSource = $resolved.source }
+            if (-not $realPath) {
+                $warnings.Add("專案 $($dir.Name) 無法反推實體路徑 (.claude.json 與 session 紀錄皆無), 合併時不做路徑改寫。")
+            } elseif ($resolved.ambiguous) {
+                $warnings.Add("專案 $($dir.Name) 的紀錄含多個不同 cwd 且無一與資料夾名相符, 已取出現最多者 ($realPath) — 匯入前請於計畫中確認。")
+            }
             $sessions = @(Get-ChildItem $dir.FullName -Filter '*.jsonl' -File -ErrorAction SilentlyContinue)
             $memDir = Join-Path $dir.FullName 'memory'
             $memFiles = @()
@@ -142,6 +250,7 @@ function Get-ClaudeInventory {
             $projects.Add([pscustomobject]@{
                 slug         = $dir.Name
                 realPath     = $realPath
+                pathSource   = $pathSource
                 pathExists   = $pathExists
                 isGitRepo    = $isGitRepo
                 gitRemote    = $gitRemote
@@ -188,11 +297,16 @@ function Get-ClaudeInventory {
             os           = [System.Environment]::OSVersion.VersionString
         }
         claudeCode = [pscustomobject]@{
-            root            = $ClaudeDir
-            exists          = (Test-Path $ClaudeDir)
-            hasSettings     = (Test-Path (Join-Path $ClaudeDir 'settings.json'))
-            hasHistory      = (Test-Path (Join-Path $ClaudeDir 'history.jsonl'))
-            projects        = $projects
+            root               = $ClaudeDir
+            exists             = (Test-Path $ClaudeDir)
+            hasSettings        = (Test-Path (Join-Path $ClaudeDir 'settings.json'))
+            hasHistory         = (Test-Path (Join-Path $ClaudeDir 'history.jsonl'))
+            configFile         = $configFile
+            hasConfig          = ($configFile -and (Test-Path $configFile))
+            configMcpServers   = $configMcp
+            configProjectCount = $configMap.Count
+            pluginMarketplaces = @(Get-ClaudePluginMarketplaces -ClaudeDir $ClaudeDir)
+            projects           = $projects
         }
         desktop = [pscustomobject]@{
             root                = $DesktopDir
@@ -340,20 +454,43 @@ function Export-ClaudePack {
             if (Test-Path $src) { Copy-Item $src -Destination (Join-Path $staging "claude\$name") -Force }
         }
 
-        # 3. Desktop MCP 設定 (僅供目標機審閱, 匯入時不自動套用)
+        # 3. ~/.claude.json 的可攜部分 (mcpServers + 每專案工具授權/信任狀態)
+        #    白名單過濾, 絕不含 userID / machineID / oauthAccount; 匯入時只進待審閱區。
+        $configFile = Get-ClaudeConfigFile -ClaudeDir $ClaudeDir
+        if ($configFile -and (Test-Path $configFile)) {
+            $sanitized = Get-SanitizedClaudeConfig -ConfigFile $configFile
+            if ($sanitized) {
+                $sanitized | ConvertTo-Json -Depth 12 |
+                    Set-Content (Join-Path $staging 'claude\claude.json.portable') -Encoding utf8
+            }
+        }
+
+        # 4. 外掛市集清單 (市集本體可重新下載, 只帶清單)
+        $mkts = @(Get-ClaudePluginMarketplaces -ClaudeDir $ClaudeDir)
+        $knownMkt = Join-Path $ClaudeDir 'plugins\known_marketplaces.json'
+        if ($mkts.Count -gt 0 -or (Test-Path $knownMkt)) {
+            $mktInfo = [ordered]@{ marketplaces = $mkts }
+            if (Test-Path $knownMkt) {
+                try { $mktInfo['known'] = (Get-Content $knownMkt -Raw -Encoding utf8 | ConvertFrom-Json) } catch { }
+            }
+            [pscustomobject]$mktInfo | ConvertTo-Json -Depth 12 |
+                Set-Content (Join-Path $staging 'claude\plugins.marketplaces.json') -Encoding utf8
+        }
+
+        # 5. Desktop MCP 設定 (僅供目標機審閱, 匯入時不自動套用)
         $desktopCfg = Join-Path $DesktopDir 'claude_desktop_config.json'
         if (Test-Path $desktopCfg) {
             New-Item -ItemType Directory -Path (Join-Path $staging 'desktop') -Force | Out-Null
             Copy-Item $desktopCfg -Destination (Join-Path $staging 'desktop\claude_desktop_config.json') -Force
         }
 
-        # 4. 黑名單保險: 從暫存區移除任何漏網的機密/快取
+        # 6. 黑名單保險: 從暫存區移除任何漏網的機密/快取
         foreach ($ex in $script:HardExclude) {
             $p = Join-Path $staging "claude\$ex"
             if (Test-Path $p) { Remove-Item $p -Recurse -Force }
         }
 
-        # 5. manifest + inventory
+        # 7. manifest + inventory
         $inv | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $staging 'inventory.json') -Encoding utf8
         $sessionFilter = $null
         if ($sessionSet) { $sessionFilter = @($exportedSessions) }
@@ -362,7 +499,7 @@ function Export-ClaudePack {
             toolVersion       = $script:ToolVersion
             createdAt         = (Get-Date).ToString('o')
             sourceMachine     = $inv.machine
-            projects          = @($selected | ForEach-Object { [pscustomobject]@{ slug = $_.slug; realPath = $_.realPath; gitRemote = $_.gitRemote } })
+            projects          = @($selected | ForEach-Object { [pscustomobject]@{ slug = $_.slug; realPath = $_.realPath; pathSource = $_.pathSource; gitRemote = $_.gitRemote } })
             sessionFilter     = $sessionFilter   # null = 全部 session
             excluded          = $script:HardExclude
         } | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $staging 'manifest.json') -Encoding utf8
@@ -525,12 +662,20 @@ function Import-ClaudePack {
         }
 
         # --- 機器特定設定 -> 待審閱區, 永不自動套用 ---
-        $reviewDir = Join-Path $TargetClaudeDir ("claudemove-review\" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
-        foreach ($cfg in @(@('claude\settings.json','settings.incoming.json'), @('desktop\claude_desktop_config.json','claude_desktop_config.incoming.json'))) {
+        # 第三欄 = 是否套用路徑改寫 (含專案絕對路徑者改寫後才能直接沿用)
+        $reviewDir = Join-Path $TargetClaudeDir ("claudemove\review\" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        $reviewSet = @(
+            @('claude\settings.json',                  'settings.incoming.json',               $false),
+            @('claude\claude.json.portable',           'claude.json.portable.json',            $true),
+            @('claude\plugins.marketplaces.json',      'plugins.marketplaces.json',            $false),
+            @('desktop\claude_desktop_config.json',    'claude_desktop_config.incoming.json',  $false)
+        )
+        foreach ($cfg in $reviewSet) {
             $src = Join-Path $work $cfg[0]
-            if (Test-Path $src) {
-                $plan.Add([pscustomobject]@{ Action='ReviewCopy'; Detail="$($cfg[1]) -> 待審閱區 (含機器特定路徑, 不自動套用)"; Src=$src; Dst=(Join-Path $reviewDir $cfg[1]); Rewrite=$false; Pairs=$null })
-            }
+            if (-not (Test-Path $src)) { continue }
+            $doRewrite = ($cfg[2] -and $globalPairs.Count -gt 0)
+            $note = if ($cfg[2]) { '含專案路徑, 已套用對映改寫' } else { '含機器特定內容, 不自動套用' }
+            $plan.Add([pscustomobject]@{ Action='ReviewCopy'; Detail="$($cfg[1]) -> 待審閱區 ($note)"; Src=$src; Dst=(Join-Path $reviewDir $cfg[1]); Rewrite=$doRewrite; Pairs=$globalPairs })
         }
 
         # --- 磁碟空間探查 ---
@@ -559,11 +704,12 @@ function Import-ClaudePack {
         }
 
         # --- 備份受影響的既有檔案 ---
-        $logDir = Join-Path $TargetClaudeDir 'claudemove-logs'
+        # 注意: 官方會自行管理 ~/.claude\backups, 所以 ClaudeMove 的產出一律收在 claudemove\ 之下
+        $logDir = Join-Path $TargetClaudeDir 'claudemove\logs'
         New-Item -ItemType Directory -Path $logDir -Force | Out-Null
         $ts = Get-Date -Format 'yyyyMMdd-HHmmss'
         if (-not $NoBackup) {
-            $backupDir = Join-Path $TargetClaudeDir "backups\claudemove-$ts"
+            $backupDir = Join-Path $TargetClaudeDir "claudemove\backups\import-$ts"
             $affected = @($plan | Where-Object { $_.Action -in 'Overwrite','MergeIndex','MergeHistory' -and $_.Dst -and (Test-Path $_.Dst) })
             foreach ($item in $affected) {
                 $rel = $item.Dst.Substring($TargetClaudeDir.Length + 1)
@@ -827,7 +973,7 @@ function Merge-ClaudeProjectSlugs {
     if (-not $Apply) { Write-Host "`nDry-run 結束, 未變更任何檔案。加上 -Apply 執行。" -ForegroundColor Yellow; return }
 
     $ts = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $bakRoot = Join-Path $ClaudeDir "backups\claudemove-dedupe-$ts"
+    $bakRoot = Join-Path $ClaudeDir "claudemove\backups\dedupe-$ts"
     New-Item -ItemType Directory -Path $bakRoot -Force | Out-Null
     # 目標 slug 既有內容先快照備份 (其自身檔案也可能含舊路徑, 待會一併改寫)
     if (Test-Path $targetDir) {
@@ -1082,4 +1228,4 @@ function Invoke-ClaudeMoveWizard {
 
 #endregion
 
-Export-ModuleMember -Function Get-ClaudeInventory, Get-ClaudeSessionList, Get-ClaudeMappingSuggestions, Invoke-ClaudeMoveWizard, Export-ClaudePack, Import-ClaudePack, Send-ClaudePack, Receive-ClaudePack, Merge-ClaudeProjectSlugs, ConvertTo-ClaudeSlug, Get-ClaudeMoveVersion
+Export-ModuleMember -Function Get-ClaudeInventory, Get-ClaudeSessionList, Get-ClaudeMappingSuggestions, Invoke-ClaudeMoveWizard, Export-ClaudePack, Import-ClaudePack, Send-ClaudePack, Receive-ClaudePack, Merge-ClaudeProjectSlugs, ConvertTo-ClaudeSlug, Get-ClaudeMoveVersion, Get-SanitizedClaudeConfig, Get-ClaudeConfigProjectMap

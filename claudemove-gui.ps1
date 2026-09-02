@@ -192,6 +192,7 @@ $gridInv.Location = '12,56'; $gridInv.Size = '960,430'; $gridInv.Anchor = 'Top,L
 Set-GridStyle $gridInv; $gridInv.ReadOnly = $true
 [void]$gridInv.Columns.Add('slug', '專案 (slug)')
 [void]$gridInv.Columns.Add('path', '實體路徑')
+[void]$gridInv.Columns.Add('src', '路徑來源')
 [void]$gridInv.Columns.Add('exists', '路徑存在')
 [void]$gridInv.Columns.Add('git', 'Git')
 [void]$gridInv.Columns.Add('sessions', 'Sessions')
@@ -357,10 +358,18 @@ $refreshInventory = {
     if (-not $inv) { $logInv.AppendText("掃描失敗。`r`n"); $statusLbl.Text = '掃描失敗'; return }
     $script:projItems = @($inv.claudeCode.projects)
     foreach ($p in $script:projItems) {
-        [void]$gridInv.Rows.Add($p.slug, $p.realPath, $p.pathExists, $p.isGitRepo, $p.sessionCount, $p.memoryCount, [math]::Round($p.sizeBytes / 1MB, 1))
+        $row = $gridInv.Rows.Add($p.slug, $p.realPath, $p.pathSource, $p.pathExists, $p.isGitRepo, $p.sessionCount, $p.memoryCount, [math]::Round($p.sizeBytes / 1MB, 1))
+        # 路徑靠推測而來者標黃, 提醒匯入前確認
+        if ($p.pathSource -eq 'cwd-frequency') {
+            $gridInv.Rows[$row].DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(254, 243, 199)
+        }
         [void]$clbProjects.Items.Add(("{0}  ({1} sessions, {2:N1} MB)" -f $p.slug, $p.sessionCount, ($p.sizeBytes / 1MB)))
     }
+    $cfgLine = if ($inv.claudeCode.hasConfig) {
+        "設定檔 .claude.json: MCP {0} 個, 已登錄專案 {1} 個" -f @($inv.claudeCode.configMcpServers).Count, $inv.claudeCode.configProjectCount
+    } else { "設定檔 .claude.json: 找不到" }
     $logInv.AppendText(("完成: {0} 個專案。Claude Code: {1}" -f $script:projItems.Count, $inv.claudeCode.root) + "`r`n")
+    $logInv.AppendText($cfgLine + "`r`n")
     $gridInv.ClearSelection()
     $statusLbl.Text = ("已盤點 {0} 個專案" -f $script:projItems.Count)
 }

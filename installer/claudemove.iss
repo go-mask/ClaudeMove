@@ -1,5 +1,5 @@
 ﻿; ClaudeMove Windows 安裝程式 (Inno Setup 6)
-#define AppVer "0.6.2"
+#define AppVer "0.7.0"
 
 [Setup]
 AppId={{7C3E9B42-5A8D-4F1E-9C64-2B0D8E7A5310}
