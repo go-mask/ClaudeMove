@@ -45,6 +45,7 @@ Claude 的資料分三種同步狀態:
 .\claudemove.ps1 sessions
 .\claudemove.ps1 export -OutputPath D:\backup\mypack -Sessions "5f5f91a8-...","f617e63e-..."
 #    指定 -Sessions 時只打包含所選 session 的專案(該專案的記憶會一併帶上)
+#    未選 session 的紀錄與附屬資料(<sessionId>\ 下的自訂標題、tool-results 截圖/PDF)都不會進包
 
 # 3. 把 mypack.claudepack.zip 帶到目標機 — 隨身碟 / 雲端硬碟, 或區網直傳:
 #    來源機:  .\claudemove.ps1 send -PackPath mypack.claudepack.zip     (顯示 IP 與一次性 Token)
@@ -72,7 +73,7 @@ Claude 的資料分三種同步狀態:
 .\claudemove.ps1 import -PackPath .\mypack.claudepack.zip -MappingFile .\map.json -Apply
 ```
 
-工具會自動改名專案資料夾(slug),並改寫 session 紀錄內的所有路徑引用。
+工具會自動改名專案資料夾(slug),並改寫 session 紀錄內的所有路徑引用——包含專案實體路徑,以及紀錄對自身資料夾的引用(`...\.claude\projects\<slug>\<sessionId>\tool-results\...`、記憶目錄),後者會隨 slug 一起改,不會指向不存在的位置。
 **建議:讓所有電腦的專案路徑保持一致,即可完全省略對映檔。**
 
 ### 專案實體路徑怎麼判定(`pathSource` 欄位)
@@ -128,6 +129,10 @@ Claude 的資料分三種同步狀態:
 
 - 憑證(`.credentials.json`)、快取、執行期金鑰(`sessions\`)**永不匯出**(硬性黑名單)
 - `~\.claude.json` 採**白名單**擷取,只帶走 `mcpServers` 與 `projects`;`userID`、`machineID`、`oauthAccount`(帳號 UUID、email、組織與訂閱資訊)一律不進遷移包
+- **設定檔內的機密值不進遷移包**(v0.7.1 起):`claude.json.portable`、`settings.json`、`claude_desktop_config.json` 進包前會遮蔽 MCP 的 `headers` / `env` 全部值、鍵名像 token / api_key / secret / password 的值、`args` 內的權杖、URL 內嵌的帳密,改留佔位符 `<REDACTED-BY-CLAUDEMOVE…>`。匯出時會顯示遮蔽了幾個值,**請在目標機重新填入**。設定檔無法解析時寧可不放入遷移包
+  - ⚠ **v0.7.0 做的遷移包不在此保護內**:它的 `claude.json.portable` 含 MCP 權杖明文,請視為機密檔保管或刪除重做
+  - 對話紀錄本身(`.jsonl`)不做內容遮蔽——你在對話中貼過的金鑰仍會隨紀錄搬移
+- Desktop 的刪除標記(`<sessionId>.desktop-released.json`)是本機狀態,不匯出、不匯入
 - import 預設 dry-run,`-Apply` 才動手
 - 執行前自動備份受影響檔案至 `~\.claude\claudemove\backups\import-<時間戳>\`
 - 全部動作寫入 `~\.claude\claudemove\logs\`(工具產出一律收在 `claudemove\` 之下,不與官方自用的 `~\.claude\backups` 混雜)

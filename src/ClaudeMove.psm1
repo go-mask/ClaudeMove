@@ -4,8 +4,11 @@
 
 Set-StrictMode -Version Latest
 
-$script:ToolVersion       = '0.7.0'
+$script:ToolVersion       = '0.7.1'
 $script:PackFormatVersion = 2
+
+# session id = 標準 GUID; 用來辨識專案資料夾內屬於某個 session 的子目錄與檔案
+$script:SessionIdPattern = '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
 
 # 永不匯出的機密/快取黑名單 (相對 .claude 根目錄)
 # sessions = 執行期 <pid>.key/<pid>.json 金鑰; plugins\marketplaces = 可重新下載的市集 clone
@@ -159,6 +162,98 @@ function Get-SanitizedClaudeConfig {
     }
     if ($out.Count -eq 0) { return $null }
     return [pscustomobject]$out
+}
+
+# --- 機密遮蔽 ---------------------------------------------------------------
+# 設定檔 (MCP 的 headers / env / args / url, settings.json 的 env ...) 常帶 API 金鑰與
+# 權杖。遷移包可能放隨身碟或走區網明文傳輸, 所以這些值一律不進包, 改留佔位符,
+# 由使用者在目標機重新填入。寧可多遮, 不可漏遮。
+$script:RedactedMark     = '<REDACTED-BY-CLAUDEMOVE: 請在目標機重新填入>'
+$script:SecretKeyCore    = '(?:token|secret|passw(?:or)?d|passwd|api[_-]?key|authorization|credential|bearer|cookie|private[_-]?key|access[_-]?key|session[_-]?key)'
+$script:SecretKeyPattern = '(?i)' + $script:SecretKeyCore
+$script:SecretArgPattern = '(?i)^(?<name>[\w\-]*' + $script:SecretKeyCore + '[\w\-]*)\s*(?<sep>[:=])\s*.+$'
+$script:SecretContainers = @('headers', 'env')   # 這些物件之下的字串值全部遮蔽
+
+function Protect-ClaudeUrl {
+    # 遮蔽 URL 內嵌的帳密與機密查詢參數
+    param([string]$Url)
+    $u = $Url -replace '(://)[^/@\s]+:[^/@\s]+@', '$1<REDACTED>@'
+    $u = [regex]::Replace($u, '(?i)([?&][^=&#]*(token|key|secret|sig|signature|auth|passw)[^=&#]*=)[^&#]+', '$1<REDACTED>')
+    return $u
+}
+
+function Protect-ClaudeArgs {
+    # 遮蔽命令列參數陣列內的機密 (就地修改), 回傳遮蔽數
+    param([object[]]$ArgList)
+    $n = 0
+    $secretNext = $false
+    for ($i = 0; $i -lt $ArgList.Count; $i++) {
+        $a = $ArgList[$i]
+        if ($a -isnot [string]) { $secretNext = $false; continue }
+        if ($secretNext) {
+            $ArgList[$i] = $script:RedactedMark; $n++; $secretNext = $false; continue
+        }
+        if ($a -match '^(?i)(bearer|basic)\s+\S+') {
+            $ArgList[$i] = $script:RedactedMark; $n++; continue
+        }
+        # name: value / name=value 形式 (含 --flag=value 與 "Authorization: Bearer x")
+        if ($a -match $script:SecretArgPattern) {
+            $ArgList[$i] = $Matches['name'] + $Matches['sep'] + $script:RedactedMark; $n++; continue
+        }
+        # 旗標後面的下一個參數是機密: --api-key X, --token X, -H / --header X
+        if ($a -match '^-{1,2}[\w\-]+$' -and ($a -match $script:SecretKeyPattern -or $a -in '-H', '--header')) {
+            $secretNext = $true
+        }
+    }
+    return $n
+}
+
+function Protect-ClaudeSecrets {
+    <#
+    .SYNOPSIS
+        遞迴遮蔽 JSON 物件內的機密值 (就地修改), 回傳遮蔽數。
+    #>
+    param($Node, [string]$ParentKey = '')
+    $n = 0
+    if ($null -eq $Node) { return 0 }
+    if ($Node -is [pscustomobject]) {
+        $forceAll = ($script:SecretContainers -contains $ParentKey)
+        foreach ($p in @($Node.PSObject.Properties)) {
+            $val = $p.Value
+            if ($val -is [string]) {
+                if ($val.Length -eq 0) { continue }
+                if ($forceAll -or $p.Name -match $script:SecretKeyPattern) {
+                    $p.Value = $script:RedactedMark; $n++
+                } elseif ($p.Name -ieq 'url') {
+                    $new = Protect-ClaudeUrl -Url $val
+                    if ($new -cne $val) { $p.Value = $new; $n++ }
+                }
+            } elseif ($val -is [System.Array]) {
+                if ($p.Name -ieq 'args') { $n += (Protect-ClaudeArgs -ArgList $val) }
+                foreach ($el in $val) { $n += (Protect-ClaudeSecrets -Node $el -ParentKey $p.Name) }
+            } elseif ($val -is [pscustomobject]) {
+                $n += (Protect-ClaudeSecrets -Node $val -ParentKey $p.Name)
+            }
+        }
+    } elseif ($Node -is [System.Array]) {
+        foreach ($el in $Node) { $n += (Protect-ClaudeSecrets -Node $el -ParentKey $ParentKey) }
+    }
+    return $n
+}
+
+function Export-RedactedJson {
+    <#
+    .SYNOPSIS
+        讀一個 JSON 設定檔, 遮蔽機密後寫到目的地; 回傳遮蔽數。
+        解析失敗時「不輸出」(寧可缺檔也不把未檢查的原檔放進遷移包) 並回傳 -1。
+    #>
+    param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$Destination)
+    try { $obj = Get-Content $Source -Raw -Encoding utf8 | ConvertFrom-Json } catch { return -1 }
+    $count = Protect-ClaudeSecrets -Node $obj
+    $dir = Split-Path $Destination -Parent
+    if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $obj | ConvertTo-Json -Depth 30 | Set-Content $Destination -Encoding utf8
+    return $count
 }
 
 function Get-RunningClaudeProcesses {
@@ -435,13 +530,29 @@ function Export-ClaudePack {
             $src = Join-Path (Join-Path $ClaudeDir 'projects') $proj.slug
             $dst = Join-Path $staging "claude\projects\$($proj.slug)"
             Copy-Item -Path $src -Destination $dst -Recurse -Force
-            foreach ($f in (Get-ChildItem $dst -Filter '*.jsonl' -File)) {
-                if ($sessionSet -and -not $sessionSet.Contains($f.BaseName)) {
-                    Remove-Item $f.FullName -Force   # 只從暫存區剔除, 不動來源
-                } else {
-                    $exportedSessions.Add($f.BaseName)
+            # 以下剔除都只動暫存區, 不動來源
+            # (a) Desktop 的刪除標記 <sid>.desktop-released.json 是本機狀態, 不跨機
+            foreach ($f in (Get-ChildItem $dst -Filter '*.desktop-released.json' -File -Recurse)) {
+                Remove-Item -LiteralPath $f.FullName -Force
+            }
+            # (b) 自選模式: 未選 session 的 jsonl 與其附屬資料一併剔除。
+            #     新版把 session 附屬資料放在 <專案>\<sessionId>\ (自訂標題, tool-results 的
+            #     截圖 / PDF ...), 只刪 jsonl 會把沒選的對話素材夾帶出去。
+            if ($sessionSet) {
+                foreach ($d in (Get-ChildItem $dst -Directory)) {
+                    if ($d.Name -match $script:SessionIdPattern -and -not $sessionSet.Contains($d.Name)) {
+                        Remove-Item -LiteralPath $d.FullName -Recurse -Force
+                    }
+                }
+                foreach ($f in (Get-ChildItem $dst -File)) {
+                    # 檔名以 session id 開頭者 (<sid>.jsonl, <sid>.xxx.json ...) 視為該 session 所有
+                    $sid = ($f.Name -split '\.', 2)[0]
+                    if ($sid -match $script:SessionIdPattern -and -not $sessionSet.Contains($sid)) {
+                        Remove-Item -LiteralPath $f.FullName -Force
+                    }
                 }
             }
+            foreach ($f in (Get-ChildItem $dst -Filter '*.jsonl' -File)) { $exportedSessions.Add($f.BaseName) }
         }
         if ($sessionSet) {
             $notFound = @($Sessions | ForEach-Object { $_ -replace '\.jsonl$', '' } | Where-Object { $exportedSessions -notcontains $_ })
@@ -449,18 +560,24 @@ function Export-ClaudePack {
         }
 
         # 2. 全域檔案 (白名單)
-        foreach ($name in @('history.jsonl', 'settings.json')) {
-            $src = Join-Path $ClaudeDir $name
-            if (Test-Path $src) { Copy-Item $src -Destination (Join-Path $staging "claude\$name") -Force }
+        $redacted = 0   # 被遮蔽的機密值總數 (API 金鑰 / 權杖不進遷移包)
+        $histSrc = Join-Path $ClaudeDir 'history.jsonl'
+        if (Test-Path $histSrc) { Copy-Item $histSrc -Destination (Join-Path $staging 'claude\history.jsonl') -Force }
+        $setSrc = Join-Path $ClaudeDir 'settings.json'
+        if (Test-Path $setSrc) {
+            $r = Export-RedactedJson -Source $setSrc -Destination (Join-Path $staging 'claude\settings.json')
+            if ($r -lt 0) { Write-Warning "settings.json 無法解析, 為避免夾帶未檢查的機密, 未放入遷移包。" } else { $redacted += $r }
         }
 
         # 3. ~/.claude.json 的可攜部分 (mcpServers + 每專案工具授權/信任狀態)
-        #    白名單過濾, 絕不含 userID / machineID / oauthAccount; 匯入時只進待審閱區。
+        #    白名單過濾, 絕不含 userID / machineID / oauthAccount; MCP 的 headers / env 等
+        #    機密值遮蔽為佔位符; 匯入時只進待審閱區。
         $configFile = Get-ClaudeConfigFile -ClaudeDir $ClaudeDir
         if ($configFile -and (Test-Path $configFile)) {
             $sanitized = Get-SanitizedClaudeConfig -ConfigFile $configFile
             if ($sanitized) {
-                $sanitized | ConvertTo-Json -Depth 12 |
+                $redacted += (Protect-ClaudeSecrets -Node $sanitized)
+                $sanitized | ConvertTo-Json -Depth 30 |
                     Set-Content (Join-Path $staging 'claude\claude.json.portable') -Encoding utf8
             }
         }
@@ -480,8 +597,8 @@ function Export-ClaudePack {
         # 5. Desktop MCP 設定 (僅供目標機審閱, 匯入時不自動套用)
         $desktopCfg = Join-Path $DesktopDir 'claude_desktop_config.json'
         if (Test-Path $desktopCfg) {
-            New-Item -ItemType Directory -Path (Join-Path $staging 'desktop') -Force | Out-Null
-            Copy-Item $desktopCfg -Destination (Join-Path $staging 'desktop\claude_desktop_config.json') -Force
+            $r = Export-RedactedJson -Source $desktopCfg -Destination (Join-Path $staging 'desktop\claude_desktop_config.json')
+            if ($r -lt 0) { Write-Warning "claude_desktop_config.json 無法解析, 為避免夾帶未檢查的機密, 未放入遷移包。" } else { $redacted += $r }
         }
 
         # 6. 黑名單保險: 從暫存區移除任何漏網的機密/快取
@@ -501,6 +618,7 @@ function Export-ClaudePack {
             sourceMachine     = $inv.machine
             projects          = @($selected | ForEach-Object { [pscustomobject]@{ slug = $_.slug; realPath = $_.realPath; pathSource = $_.pathSource; gitRemote = $_.gitRemote } })
             sessionFilter     = $sessionFilter   # null = 全部 session
+            redactedSecrets   = $redacted        # 設定檔中被遮蔽的機密值數量, 需在目標機重新填入
             excluded          = $script:HardExclude
         } | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $staging 'manifest.json') -Encoding utf8
 
@@ -519,6 +637,9 @@ function Export-ClaudePack {
 
         $size = (Get-Item $OutputPath).Length
         Write-Host ("匯出完成: {0} ({1:N1} MB, {2} 個專案, {3} 個 session)" -f $OutputPath, ($size / 1MB), $selected.Count, $exportedSessions.Count) -ForegroundColor Green
+        if ($redacted -gt 0) {
+            Write-Host ("已遮蔽設定檔中的 {0} 個機密值 (API 金鑰 / 權杖不進遷移包, 請在目標機重新填入)。" -f $redacted) -ForegroundColor Yellow
+        }
         return Get-Item $OutputPath
     }
     finally {
@@ -539,6 +660,36 @@ function Get-PathRewriteVariants {
         @{ From = $Old.Replace('\', '/');  To = $New.Replace('\', '/') }   # E:/x
         @{ From = $Old;                    To = $New }                     # E:\x 原樣
     )
+}
+
+function New-SlugRewritePair {
+    # 紀錄會以絕對路徑引用自己的資料夾 (...\.claude\projects\<slug>\<sid>\tool-results\...,
+    # 記憶目錄等)。專案換路徑後 slug 跟著變, 這些引用要一起改, 否則指向不存在的位置。
+    param([Parameter(Mandatory)][string]$OldSlug, [Parameter(Mandatory)][string]$NewSlug)
+    return @{ Old = ".claude\projects\$OldSlug"; New = ".claude\projects\$NewSlug"; Kind = 'slug' }
+}
+
+function Invoke-PathRewrite {
+    <#
+    .SYNOPSIS
+        對文字套用一組路徑改寫規則 (每條規則含 JSON 轉義 / 正斜線 / 原樣三種寫法)。
+    .NOTES
+        Kind='slug' 的規則要求後面不能再接 slug 字元 (英數或 '-'), 避免
+        F--AI 誤傷 F--AI-Tools 這類以前者為字首的另一個專案。
+    #>
+    param([string]$Text, $Pairs)
+    if (-not $Pairs) { return $Text }
+    foreach ($pair in $Pairs) {
+        $isSlug = ($pair.ContainsKey('Kind') -and $pair['Kind'] -eq 'slug')
+        foreach ($v in (Get-PathRewriteVariants -Old $pair['Old'] -New $pair['New'])) {
+            if ($isSlug) {
+                $Text = [regex]::Replace($Text, [regex]::Escape($v.From) + '(?![A-Za-z0-9\-])', $v.To.Replace('$', '$$'))
+            } else {
+                $Text = $Text.Replace($v.From, $v.To)
+            }
+        }
+    }
+    return $Text
 }
 
 function Import-ClaudePack {
@@ -618,6 +769,11 @@ function Import-ClaudePack {
                 $newSlug = ConvertTo-ClaudeSlug $TargetUserProfile
             }
             $pairs = [System.Collections.Generic.List[object]]::new()
+            if ($newSlug -cne $proj.slug) {
+                $slugPair = New-SlugRewritePair -OldSlug $proj.slug -NewSlug $newSlug
+                $pairs.Add($slugPair)
+                $globalPairs.Add($slugPair)
+            }
             if ($oldPath -and $newPath -and ($oldPath -ne $newPath)) {
                 $pairs.Add(@{ Old = $oldPath; New = $newPath })
                 $globalPairs.Add(@{ Old = $oldPath; New = $newPath })
@@ -633,6 +789,8 @@ function Import-ClaudePack {
                 continue
             }
             foreach ($f in (Get-ChildItem $srcDir -File -Recurse)) {
+                # 舊版遷移包可能夾帶 Desktop 的刪除標記 (來源機的本機狀態), 不匯入
+                if ($f.Name -like '*.desktop-released.json') { continue }
                 $rel = $f.FullName.Substring($srcDir.Length + 1)
                 $dstFile = Join-Path $dstDir $rel
                 $isMemoryIndex = ($rel -ieq 'memory\MEMORY.md')
@@ -728,12 +886,7 @@ function Import-ClaudePack {
                 { $_ -in 'CopyNew', 'Overwrite', 'ReviewCopy' } {
                     New-Item -ItemType Directory -Path (Split-Path $item.Dst -Parent) -Force | Out-Null
                     if ($item.Rewrite) {
-                        $text = [System.IO.File]::ReadAllText($item.Src)
-                        foreach ($pair in $item.Pairs) {
-                            foreach ($v in (Get-PathRewriteVariants -Old $pair.Old -New $pair.New)) {
-                                $text = $text.Replace($v.From, $v.To)
-                            }
-                        }
+                        $text = Invoke-PathRewrite -Text ([System.IO.File]::ReadAllText($item.Src)) -Pairs $item.Pairs
                         [System.IO.File]::WriteAllText($item.Dst, $text)
                     } else {
                         Copy-Item $item.Src $item.Dst -Force
@@ -743,11 +896,7 @@ function Import-ClaudePack {
                 'MergeIndex' {
                     $existing = @(Get-Content $item.Dst -Encoding utf8)
                     $incomingText = [System.IO.File]::ReadAllText($item.Src)
-                    if ($item.Rewrite) {
-                        foreach ($pair in $item.Pairs) {
-                            foreach ($v in (Get-PathRewriteVariants -Old $pair.Old -New $pair.New)) { $incomingText = $incomingText.Replace($v.From, $v.To) }
-                        }
-                    }
+                    if ($item.Rewrite) { $incomingText = Invoke-PathRewrite -Text $incomingText -Pairs $item.Pairs }
                     $incoming = $incomingText -split "`r?`n"
                     $missing = @($incoming | Where-Object { $_.Trim() -and ($existing -notcontains $_) })
                     if ($missing.Count -gt 0) { Add-Content -Path $item.Dst -Value $missing -Encoding utf8 }
@@ -755,11 +904,7 @@ function Import-ClaudePack {
                 }
                 'MergeHistory' {
                     $incomingText = [System.IO.File]::ReadAllText($item.Src)
-                    if ($item.Rewrite) {
-                        foreach ($pair in $item.Pairs) {
-                            foreach ($v in (Get-PathRewriteVariants -Old $pair.Old -New $pair.New)) { $incomingText = $incomingText.Replace($v.From, $v.To) }
-                        }
-                    }
+                    if ($item.Rewrite) { $incomingText = Invoke-PathRewrite -Text $incomingText -Pairs $item.Pairs }
                     if (-not (Test-Path $item.Dst)) {
                         [System.IO.File]::WriteAllText($item.Dst, $incomingText)
                         $log.Add("MergeHistory: 目標無 history.jsonl, 直接複製")
@@ -981,17 +1126,25 @@ function Merge-ClaudeProjectSlugs {
     }
     New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
     $moved = 0
+    $pathPairs = [System.Collections.Generic.List[object]]::new()
+    if ($rewrite) { $pathPairs.Add(@{ Old = $SourcePath; New = $IntoPath }) }
+    $allPairs = [System.Collections.Generic.List[object]]::new()
     foreach ($s in $sources) {
         $srcDir = Join-Path (Join-Path $ClaudeDir 'projects') $s.slug
+        # 紀錄內嵌的 ...\.claude\projects\<來源 slug>\... 也要改指向目標 slug
+        $pairs = [System.Collections.Generic.List[object]]::new()
+        $slugPair = New-SlugRewritePair -OldSlug $s.slug -NewSlug $targetSlug
+        $pairs.Add($slugPair); $allPairs.Add($slugPair)
+        foreach ($pp in $pathPairs) { $pairs.Add($pp) }
         foreach ($f in (Get-ChildItem $srcDir -File -Recurse)) {
+            if ($f.Name -like '*.desktop-released.json') { continue }   # Desktop 的刪除標記不合併
             $rel = $f.FullName.Substring($srcDir.Length + 1)
             $dst = Join-Path $targetDir $rel
             if (Test-Path $dst) {
                 if ($rel -ieq 'memory\MEMORY.md') {
                     # 索引檔逐行聯集
                     $existing = @(Get-Content $dst -Encoding utf8)
-                    $incomingText = [System.IO.File]::ReadAllText($f.FullName)
-                    if ($rewrite) { foreach ($v in (Get-PathRewriteVariants -Old $SourcePath -New $IntoPath)) { $incomingText = $incomingText.Replace($v.From, $v.To) } }
+                    $incomingText = Invoke-PathRewrite -Text ([System.IO.File]::ReadAllText($f.FullName)) -Pairs $pairs
                     $missing = @(($incomingText -split "`r?`n") | Where-Object { $_.Trim() -and ($existing -notcontains $_) })
                     if ($missing.Count -gt 0) { Add-Content -Path $dst -Value $missing -Encoding utf8 }
                     continue
@@ -1000,9 +1153,8 @@ function Merge-ClaudeProjectSlugs {
                 if ((Get-Item $dst).LastWriteTimeUtc -ge $f.LastWriteTimeUtc) { continue }
             }
             New-Item -ItemType Directory -Path (Split-Path $dst -Parent) -Force | Out-Null
-            if ($rewrite -and $f.Extension -in '.jsonl', '.json', '.md') {
-                $text = [System.IO.File]::ReadAllText($f.FullName)
-                foreach ($v in (Get-PathRewriteVariants -Old $SourcePath -New $IntoPath)) { $text = $text.Replace($v.From, $v.To) }
+            if ($f.Extension -in '.jsonl', '.json', '.md') {
+                $text = Invoke-PathRewrite -Text ([System.IO.File]::ReadAllText($f.FullName)) -Pairs $pairs
                 [System.IO.File]::WriteAllText($dst, $text)
             } else {
                 Copy-Item $f.FullName $dst -Force
@@ -1012,15 +1164,13 @@ function Merge-ClaudeProjectSlugs {
         Move-Item $srcDir (Join-Path $bakRoot $s.slug) -Force
         $moved++
     }
-    # 目標 slug 自身檔案若仍殘留舊路徑, 一併改寫
+    # 目標 slug 自身檔案若仍殘留舊路徑 / 舊 slug 引用, 一併改寫
     $fixed = 0
-    if ($rewrite) {
-        foreach ($f in (Get-ChildItem $targetDir -File -Recurse | Where-Object { $_.Extension -in '.jsonl', '.json', '.md' })) {
-            $text = [System.IO.File]::ReadAllText($f.FullName)
-            $orig = $text
-            foreach ($v in (Get-PathRewriteVariants -Old $SourcePath -New $IntoPath)) { $text = $text.Replace($v.From, $v.To) }
-            if ($text -ne $orig) { [System.IO.File]::WriteAllText($f.FullName, $text); $fixed++ }
-        }
+    foreach ($pp in $pathPairs) { $allPairs.Add($pp) }
+    foreach ($f in (Get-ChildItem $targetDir -File -Recurse | Where-Object { $_.Extension -in '.jsonl', '.json', '.md' })) {
+        $orig = [System.IO.File]::ReadAllText($f.FullName)
+        $text = Invoke-PathRewrite -Text $orig -Pairs $allPairs
+        if ($text -cne $orig) { [System.IO.File]::WriteAllText($f.FullName, $text); $fixed++ }
     }
     Write-Host ("去重完成: {0} 個 slug 已合併進 {1}, 另修正 {2} 個殘留舊路徑的檔案, 備份於 {3}" -f $moved, $targetSlug, $fixed, $bakRoot) -ForegroundColor Green
 }
